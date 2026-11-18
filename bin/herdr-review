@@ -26,6 +26,11 @@ Each valid verdict is kept as verdict-<round>.md; a re-review points the
 tester at the previous one. The request tells the tester to follow the
 repository's AGENTS.md / CLAUDE.md for how to run checks.
 State and message files live in /tmp/herdr-review/<caller pane>/.
+A tester never runs herdr-review: a call from a tester tab ('<prefix> ▸ ...')
+or from a pane that has a review request open exits 1 without side effects.
+The tester is found by its agent name first, then by its tab tag, so one
+developer tab keeps one tester. When that tester is busy with an earlier
+request, the new request waits for it (within --timeout) instead of failing.
 Requires: herdr, herdr-pane (same PATH), git.
 """
 import argparse
@@ -47,6 +52,9 @@ REQUEST = """\
 
 You are an independent tester. You did not write these changes.
 Do not modify any file in the repository and do not run `herdr-review`.
+This overrides any AGENTS.md, CLAUDE.md or skill rule that says to run
+herdr-review (or another independent review) before finishing: you are that
+review. Writing the verdict file is your final step.
 
 Developer tab: {devtab}
 Repository: {repo}
@@ -157,6 +165,38 @@ def agent_status(pane):
         return "unknown"
 
 
+def agents_in(ws):
+    p = run("herdr", "agent", "list", check=False)
+    try:
+        agents = json.loads(p.stdout)["result"]["agents"]
+    except (ValueError, KeyError, TypeError):
+        return []
+    return [x for x in agents if x.get("workspace_id") == ws]
+
+
+def tester_request_for(me):
+    """The request file that asked the agent in pane `me` to review, if any."""
+    for f in ROOT.glob("*/pending.json"):
+        try:
+            if json.loads(f.read_text()).get("pane") == me:
+                return f.parent / "request.md"
+        except (ValueError, OSError):
+            continue
+    return None
+
+
+def wait_until_idle(pane, timeout, label):
+    """Queue behind a request the tester is still working on."""
+    if agent_status(pane) != "working":
+        return
+    print(f"herdr-review: tester '{label}' is busy with an earlier request; waiting "
+          f"(up to {timeout}s)...", file=sys.stderr, flush=True)
+    p = run("herdr", "agent", "wait", pane, "--timeout", str(timeout * 1000), check=False)
+    if p.returncode != 0 or agent_status(pane) == "working":
+        sys.exit(f"tester '{label}' (pane {pane}) is still busy after {timeout}s; nothing was sent. "
+                 f"Check that tab, then run herdr-review again.")
+
+
 def start_agent(pane, name, tries=20):
     """`herdr agent start` needs an idle shell prompt; a fresh tab may not have one yet."""
     err = ""
@@ -165,6 +205,9 @@ def start_agent(pane, name, tries=20):
         if p.returncode == 0:
             return
         err = (p.stderr or p.stdout).strip()
+        if "name_taken" in err or "already used" in err:
+            sys.exit(f"agent start failed: the tester name '{name}' belongs to another pane. "
+                     f"Close the stale tester tab (or rename that agent) and run herdr-review again.\n{err}")
         if "busy" not in err.lower():
             sys.exit(f"agent start failed: {err}")
         time.sleep(1.5)
@@ -279,6 +322,14 @@ def main():
     tabs = herdr_json("tab", "list", "--workspace", ws).get("tabs", [])
     dev_label = next((str(t.get("label") or "") for t in tabs if t.get("tab_id") == tab), "")
 
+    # A tester must not start its own review: that re-tags its tab and spawns a
+    # tester for the tester. Refuse before touching any tab or file.
+    own_request = tester_request_for(me)
+    if dev_label.startswith(a.tester + " ▸ ") or own_request:
+        where = f" Your request: {own_request}." if own_request else ""
+        sys.exit("herdr-review: this pane is a herdr-review tester. Testers do not run "
+                 "herdr-review: write your verdict file as the request says and stop." + where)
+
     def tag_of(t):
         m = TAG.search(str(t.get("label") or ""))
         return m.group(1) if m else None
@@ -296,16 +347,24 @@ def main():
         run("herdr", "tab", "rename", tab, f"{base} [{tag}]")
     label = f"{a.tester} ▸ {base} [{tag}]"
 
-    # tester tab + agent
+    # tester tab + agent: the agent name is the stable identity (a tab label can
+    # change); fall back to the tab tag for a tab whose agent has not started yet.
     hp = shutil.which("herdr-pane") or str(Path(__file__).resolve().with_name("herdr-pane"))
-    existing = next((t for t in tabs if t.get("tab_id") != tab and is_tester(t)
-                     and tag_of(t) == tag), None)
+    name = agent_name(a.tester, base, tag)
+    by_name = next((x for x in agents_in(ws) if x.get("name") == name and x.get("pane_id") != me), None)
+    existing = None
+    if by_name:
+        existing = next((t for t in tabs if t.get("tab_id") == by_name.get("tab_id")), None)
+    if not existing:
+        existing = next((t for t in tabs if t.get("tab_id") != tab and is_tester(t)
+                         and tag_of(t) == tag), None)
     pane = None
     if existing:
         if existing.get("label") != label:  # follow renames of the developer tab
             run("herdr", "tab", "rename", existing["tab_id"], label, check=False)
         panes = herdr_json("pane", "list", "--workspace", ws).get("panes", [])
-        pane = next((p["pane_id"] for p in panes if p.get("tab_id") == existing["tab_id"]), None)
+        pane = by_name["pane_id"] if by_name and by_name.get("tab_id") == existing["tab_id"] else \
+            next((p["pane_id"] for p in panes if p.get("tab_id") == existing["tab_id"]), None)
         if not pane:
             sys.exit(f"tester tab {existing['tab_id']} has no listed pane")
 
@@ -346,7 +405,9 @@ def main():
     if not pane:
         pane = run(hp, label, "--cwd", repo).stdout.strip()
     if agent_status(pane) is None:
-        start_agent(pane, agent_name(a.tester, base, tag))
+        start_agent(pane, name)
+    else:
+        wait_until_idle(pane, a.timeout, label)
 
     pending.write_text(json.dumps({"pane": pane, "round": n, "max": a.max, "label": label}))
     msg = f"Review request: read {req} and follow it. Write the verdict to {ver}."

@@ -7,3 +7,5 @@
   follow its result. Report `changes: limit reached` or a review error as
   incomplete work. This is not human or PR approval.
 - Skip it when only documentation or prose changed, and say so in the handoff.
+- Never run it when you are the herdr-review tester (a request in
+  `/tmp/herdr-review/` asked you to review): your verdict file is the review.

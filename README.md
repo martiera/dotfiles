@@ -28,6 +28,9 @@ or the template to update every repo you pass.
 
 - `bin/herdr-review`: asks an independent tester agent in a herdr tab to review
   the current repository's changes and prints its verdict. See `--help`.
+  One tester tab per developer tab, found by its agent name; a new request
+  waits while that tester is busy, and a tester pane cannot start a review of
+  its own (that used to spawn a "tester ▸ tester ▸ …" tab).
 - `bin/herdr-pane`: resolves or creates a herdr pane/tab by name; used by
   `herdr-review`.
 - `agents/skills/herdr-review/SKILL.md`: source of the `herdr-review` agent
