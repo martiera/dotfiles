@@ -26,6 +26,8 @@ Each valid verdict is kept as verdict-<round>.md; a re-review points the
 tester at the previous one. The request tells the tester to follow the
 repository's AGENTS.md / CLAUDE.md for how to run checks.
 State and message files live in /tmp/herdr-review/<caller pane>/.
+If herdr reports the prompt as stalled (the tester did not look busy within
+5 s), the request is kept and the tester is given LATE_START seconds to start.
 A tester never runs herdr-review: a call from a tester tab ('<prefix> ▸ ...')
 or from a pane that has a review request open exits 1 without side effects.
 The tester is found by its agent name first, then by its tab tag, so one
@@ -195,6 +197,22 @@ def wait_until_idle(pane, timeout, label):
     if p.returncode != 0 or agent_status(pane) == "working":
         sys.exit(f"tester '{label}' (pane {pane}) is still busy after {timeout}s; nothing was sent. "
                  f"Check that tab, then run herdr-review again.")
+
+
+LATE_START = 60  # seconds a stalled prompt may take to show the tester working
+
+
+def await_late_start(pane, ver, timeout):
+    """After herdr's agent_prompt_stalled: wait for the tester to start (or for the
+    verdict), then for it to finish. Returns the wait result, or None if it never started."""
+    deadline = time.time() + LATE_START
+    while time.time() < deadline:
+        if ver.exists() or agent_status(pane) in ("working", "blocked"):
+            print("herdr-review: the tester started late; waiting for its verdict...",
+                  file=sys.stderr, flush=True)
+            return run("herdr", "agent", "wait", pane, "--timeout", str(timeout * 1000), check=False)
+        time.sleep(2)
+    return None
 
 
 def start_agent(pane, name, tries=20):
@@ -411,8 +429,13 @@ def main():
 
     pending.write_text(json.dumps({"pane": pane, "round": n, "max": a.max, "label": label}))
     msg = f"Review request: read {req} and follow it. Write the verdict to {ver}."
+    started = time.time()
     p = run("herdr", "agent", "prompt", pane, msg, "--wait",
             "--timeout", str(a.timeout * 1000), check=False)
+    if p.returncode != 0 and "prompt_stalled" in (p.stderr + p.stdout):
+        # herdr gives up when the tester does not look busy within 5 s; a slow
+        # agent (still "done" from the last round) often starts a moment later.
+        p = await_late_start(pane, ver, max(1, a.timeout - int(time.time() - started))) or p
     if p.returncode != 0 and not ver.exists() and "timeout" not in (p.stderr + p.stdout).lower():
         pending.unlink(missing_ok=True)  # the prompt was never accepted
     finish(st, n, a.max, label, pane, p)
