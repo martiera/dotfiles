@@ -1,0 +1,100 @@
+#!/bin/sh
+# Usage: ./install.sh [REPO ...]
+#
+# Always: symlink bin/* into ~/.local/bin (never overwrites a real file).
+# For each REPO (a git checkout) also enable herdr-review there:
+#   - write .agents/skills/herdr-review/SKILL.md from agents/skills/
+#   - add or refresh the review rule in AGENTS.md, between
+#     <!-- herdr-review:start --> and <!-- herdr-review:end -->
+# Nothing is committed in REPO; review and commit the changes yourself.
+# Safe to re-run.
+set -eu
+
+here=$(cd "$(dirname "$0")" && pwd)
+start='<!-- herdr-review:start -->'
+end='<!-- herdr-review:end -->'
+
+case "${1:-}" in
+  -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+link_bin() {
+  mkdir -p "$HOME/.local/bin"
+  for f in "$here"/bin/*; do
+    dst="$HOME/.local/bin/$(basename "$f")"
+    if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+      echo "skip $dst: a real file is in the way" >&2
+      continue
+    fi
+    ln -sfn "$f" "$dst"
+    echo "linked $dst"
+  done
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) echo "warning: ~/.local/bin is not on PATH" >&2 ;;
+  esac
+  command -v herdr >/dev/null 2>&1 || echo "warning: herdr is not installed; herdr-review needs it" >&2
+}
+
+install_skill() {
+  repo=$1
+  src="$here/agents/skills/herdr-review/SKILL.md"
+  dst="$repo/.agents/skills/herdr-review/SKILL.md"
+  if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+    echo "  skill: unchanged ($dst)"
+    return
+  fi
+  verb=added; [ -f "$dst" ] && verb=updated
+  mkdir -p "$(dirname "$dst")"
+  cp "$src" "$dst"
+  echo "  skill: $verb ($dst)"
+}
+
+install_rule() {
+  repo=$1
+  agents="$repo/AGENTS.md"
+  block=$(printf '%s\n' "$start"; cat "$here/templates/AGENTS.herdr-review.md"; printf '%s\n' "$end")
+
+  if [ ! -f "$agents" ]; then
+    printf '# Agent guidance\n\n%s\n' "$block" > "$agents"
+    echo "  AGENTS.md: created with the review rule"
+    return
+  fi
+  if grep -qF "$start" "$agents"; then
+    if ! grep -qF "$end" "$agents"; then
+      echo "  AGENTS.md: '$start' has no matching end marker; fix it by hand" >&2
+      return 1
+    fi
+    tmp=$(mktemp)
+    # replace everything between the markers (inclusive) with the current block
+    BLOCK=$block awk -v s="$start" -v e="$end" '
+      $0 == s { print ENVIRON["BLOCK"]; skip = 1; next }
+      $0 == e { skip = 0; next }
+      !skip' "$agents" > "$tmp"
+    if cmp -s "$tmp" "$agents"; then
+      rm -f "$tmp"; echo "  AGENTS.md: rule unchanged"
+    else
+      cat "$tmp" > "$agents"; rm -f "$tmp"; echo "  AGENTS.md: rule refreshed"
+    fi
+    return
+  fi
+  if grep -q 'herdr-review' "$agents"; then
+    echo "  AGENTS.md: already mentions herdr-review without markers; left as is"
+    return
+  fi
+  printf '\n%s\n' "$block" >> "$agents"
+  echo "  AGENTS.md: rule appended"
+}
+
+link_bin
+
+for arg in "$@"; do
+  if ! repo=$(git -C "$arg" rev-parse --show-toplevel 2>/dev/null); then
+    echo "skip $arg: not a git checkout" >&2
+    continue
+  fi
+  echo "repo $repo"
+  install_skill "$repo"
+  install_rule "$repo"
+done
+[ $# -eq 0 ] || echo "Review and commit the changes in each repo yourself."

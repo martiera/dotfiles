@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""herdr-review [--max N] [--timeout SEC] [--tester NAME] [--base REV] [--new] (SUMMARY | -)
+herdr-review --wait-only [--timeout SEC] [--tester NAME]
+
+Ask an independent omp agent in this developer tab's own tester tab
+('<prefix> ▸ <dev tab name> [<tag>]') to review the changes of the current
+git repository since --base (default HEAD: uncommitted work only), wait for
+it, print its verdict.
+
+Run from a herdr pane. SUMMARY is what was done ('-' reads stdin); its
+'Files:' line is the review scope. --wait-only sends nothing: it waits for a
+review that is already running (e.g. after the caller lost the first run)
+and prints its verdict. --new starts a new task: the round counter restarts.
+
+Stdout starts with one of (exit code in brackets):
+  changes: approved                 [0]
+  changes: needed                   [4]  followed by the findings
+  changes: limit reached            [3]
+  changes: skipped (docs only)      [5]  no tester is asked
+Errors exit 1 (message on stderr), usage errors 2.
+The review is skipped when every in-scope file is documentation (see
+DOC_SUFFIXES). The scope is the summary's 'Files:' entry; without one, every
+file changed since --base, including untracked files.
+A round is counted only when the tester writes a valid verdict.
+Each valid verdict is kept as verdict-<round>.md; a re-review points the
+tester at the previous one. The request tells the tester to follow the
+repository's AGENTS.md / CLAUDE.md for how to run checks.
+State and message files live in /tmp/herdr-review/<caller pane>/.
+Requires: herdr, herdr-pane (same PATH), git.
+"""
+import argparse
+import json
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path("/tmp/herdr-review")
+STALE_AFTER = 3600  # round counter restarts after 1 hour without a review
+
+REQUEST = """\
+# Independent review request (round {n} of {mx})
+
+You are an independent tester. You did not write these changes.
+Do not modify any file in the repository and do not run `herdr-review`.
+
+Developer tab: {devtab}
+Repository: {repo}
+{changes}
+Review scope: the files listed under "Files:" in the developer summary below.
+Other changes in the working tree belong to someone else: do not report them,
+unless the in-scope changes break, depend on, or conflict with them.
+Treat the developer summary as a claim and verify it against the code.
+{howto}Run the repository's relevant tests, lint or build if they exist.
+{again}
+Report only real problems: bugs, requirements from the summary that are not met, failing tests, security issues. No style nitpicks.
+
+Write your verdict to: {ver}
+The first line must be exactly one of:
+changes: approved
+changes: needed
+If needed, follow with a numbered list: file:line, the problem, the required change.
+
+## Developer summary
+{summary}
+"""
+
+AGAIN = ("This is a re-review. Your previous verdict is in {prev}: first check that "
+         "every finding in it is fixed (or that the developer summary gives a valid reason "
+         "not to), then review the whole change again.\n")
+
+EXIT_APPROVED, EXIT_LIMIT, EXIT_NEEDED, EXIT_SKIPPED = 0, 3, 4, 5
+
+DOC_SUFFIXES = {".md", ".mdx", ".markdown", ".rst", ".adoc", ".txt"}
+SUMMARY_KEY = re.compile(r"^\s*(Task|Done|Files|Verify|Open points)\s*:", re.I)
+
+
+def summary_files(summary):
+    """Paths named in the summary's 'Files:' entry (it may continue on the next lines)."""
+    out, inside = [], False
+    for line in summary.splitlines():
+        key = SUMMARY_KEY.match(line)
+        if key:
+            inside = key.group(1).lower() == "files"
+            line = line[key.end():] if inside else line
+        if not inside:
+            continue
+        for tok in re.split(r"[\s,;]+", line):
+            tok = tok.strip("`'\"*()[]:-")
+            if tok and ("/" in tok or "." in tok) and not tok.startswith("http"):
+                out.append(tok)
+    return out
+
+
+def changed_files(repo, base):
+    diff = run("git", "-C", repo, "diff", "--name-only", base).stdout.split("\n")
+    new = run("git", "-C", repo, "ls-files", "--others", "--exclude-standard").stdout.split("\n")
+    return [f for f in diff + new if f]
+
+
+def is_doc(path):
+    return Path(path).suffix.lower() in DOC_SUFFIXES
+
+
+AGENT_DOCS = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
+
+
+def howto_text(repo):
+    """Point the tester at the repo's agent instructions: they say how and where to run checks."""
+    docs = [f for f in AGENT_DOCS if (Path(repo) / f).is_file()]
+    if not docs:
+        return ""
+    return (f"Before running any check, read the repository's agent instructions "
+            f"({', '.join(docs)}, and the nearest directory AGENTS.md of each changed file) "
+            f"and follow their rules on how and where to run tests, lint and build "
+            f"(for example a container or a test database). If a check cannot run "
+            f"in your environment, say so in the verdict instead of guessing.\n")
+
+
+def run(*cmd, check=True):
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        sys.exit(f"{' '.join(cmd[:3])}: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+TAG = re.compile(r"\s*\[([0-9a-f]{4})\]\s*$")
+
+
+def agent_name(prefix, base, tag):
+    """herdr agent name: [a-z][a-z0-9_-]{0,31}."""
+    parts = [slug(prefix) or "tester", slug(base)[:12].strip("-"), tag]
+    return "-".join(x for x in parts if x)[:32].strip("-")
+
+
+def herdr_json(*args):
+    p = run("herdr", *args)
+    out = json.loads(p.stdout) if p.stdout.strip() else {}
+    return out.get("result", out)
+
+
+def agent_status(pane):
+    p = run("herdr", "agent", "get", pane, check=False)
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout)["result"]["agent"].get("agent_status")
+    except (ValueError, KeyError, TypeError):
+        return "unknown"
+
+
+def start_agent(pane, name, tries=20):
+    """`herdr agent start` needs an idle shell prompt; a fresh tab may not have one yet."""
+    err = ""
+    for _ in range(tries):
+        p = run("herdr", "agent", "start", name, "--kind", "omp", "--pane", pane, check=False)
+        if p.returncode == 0:
+            return
+        err = (p.stderr or p.stdout).strip()
+        if "busy" not in err.lower():
+            sys.exit(f"agent start failed: {err}")
+        time.sleep(1.5)
+    info = run("herdr", "pane", "process-info", pane, check=False).stdout.strip()
+    sys.exit(f"tester pane {pane} stayed busy for {tries} tries: {err}\nForeground processes: {info}")
+
+
+def changes_text(repo, base):
+    if base == "HEAD":
+        return (f"Changes to review: uncommitted work. Find it yourself: "
+                f"`git -C {repo} status --porcelain` and `git -C {repo} diff HEAD` "
+                f"(include untracked files).")
+    return (f"Changes to review: commits after {base} plus uncommitted work. Find them yourself: "
+            f"`git -C {repo} log --oneline {base}..HEAD`, `git -C {repo} diff {base}` and "
+            f"`git -C {repo} status --porcelain` (include untracked files).")
+
+
+def finish(st, n, mx, label, pane, p=None):
+    """Read the verdict after the tester stopped; count the round only if it is valid."""
+    rf, pending, ver = st["round"], st["pending"], st["verdict"]
+    if not ver.exists():
+        status = agent_status(pane)
+        if pending.exists() and status in ("working", "blocked"):
+            why = (f"{(p.stderr or p.stdout).strip()}; " if p is not None and p.returncode != 0 else "")
+            sys.exit(f"tester did not finish ({why}status: {status}).\n"
+                     f"Check the '{label}' tab (pane {pane}); it may be blocked on an approval.\n"
+                     f"This round was not counted. Once it continues: herdr-review --wait-only")
+        if p is not None and p.returncode != 0:
+            pending.unlink(missing_ok=True)
+            sys.exit(f"tester did not finish: {(p.stderr or p.stdout).strip()}\n"
+                     f"Check the '{label}' tab (pane {pane}). This round was not counted.")
+        tail = run("herdr", "agent", "read", pane, "--lines", "40", check=False).stdout
+        pending.unlink(missing_ok=True)
+        sys.exit(f"tester finished without writing {ver}; this round was not counted. "
+                 f"Last output:\n{tail}")
+
+    text = ver.read_text().strip()
+    first = text.splitlines()[0].strip().lower() if text else ""
+    if first.startswith("changes: approved"):
+        rf.unlink(missing_ok=True)
+        (ver.parent / f"verdict-{n}.md").write_text(text + "\n")
+    elif first.startswith("changes: needed"):
+        rf.write_text(str(n))
+        (ver.parent / f"verdict-{n}.md").write_text(text + "\n")
+    else:
+        pending.unlink(missing_ok=True)
+        sys.exit(f"verdict has no valid first line ('changes: approved' or 'changes: needed'); "
+                 f"this round was not counted:\n{text}")
+    pending.unlink(missing_ok=True)
+    print(text)
+    print(f"\n(review round {n} of {mx})")
+    sys.exit(EXIT_APPROVED if first.startswith("changes: approved") else EXIT_NEEDED)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("summary", nargs="?", help="what was done; '-' reads stdin")
+    ap.add_argument("--max", type=int, default=4, help="max review rounds (default 4)")
+    ap.add_argument("--timeout", type=int, default=1800, help="seconds to wait for the tester")
+    ap.add_argument("--tester", default="tester", help="tester tab label prefix (default: tester)")
+    ap.add_argument("--base", default="HEAD",
+                    help="review commits after REV plus uncommitted work (default HEAD)")
+    ap.add_argument("--new", action="store_true", help="new task: restart the round counter")
+    ap.add_argument("--wait-only", action="store_true",
+                    help="send nothing; wait for the running review and print its verdict")
+    a = ap.parse_args()
+    if a.wait_only == (a.summary is not None):
+        ap.error("give SUMMARY (or '-'), or --wait-only, not both")
+
+    me, tab, ws = (os.environ.get(k) for k in
+                   ("HERDR_PANE_ID", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID"))
+    if not (me and tab and ws):
+        sys.exit("not inside a herdr pane (HERDR_PANE_ID / HERDR_TAB_ID / HERDR_WORKSPACE_ID unset)")
+
+    d = ROOT / re.sub(r"\W+", "_", me)
+    d.mkdir(parents=True, exist_ok=True)
+    st = {"round": d / "round", "pending": d / "pending.json",
+          "request": d / "request.md", "verdict": d / "verdict.md"}
+    rf, pending, req, ver = st["round"], st["pending"], st["request"], st["verdict"]
+
+    # --wait-only: pick up a review that was already sent
+    if a.wait_only:
+        if not pending.exists():
+            sys.exit("no review is pending for this pane; run herdr-review with a summary")
+        info = json.loads(pending.read_text())
+        pane, n, mx, label = info["pane"], info["round"], info["max"], info["label"]
+        if agent_status(pane) in ("working", "unknown"):
+            p = run("herdr", "agent", "wait", pane, "--timeout", str(a.timeout * 1000), check=False)
+        else:
+            p = None
+        finish(st, n, mx, label, pane, p)
+        return
+
+    summary = sys.stdin.read() if a.summary == "-" else a.summary
+    repo = run("git", "rev-parse", "--show-toplevel").stdout.strip()
+    if run("git", "-C", repo, "rev-parse", "--verify", "--quiet", f"{a.base}^{{commit}}",
+           check=False).returncode != 0:
+        sys.exit(f"--base {a.base}: not a commit in {repo}")
+
+    # docs-only changes need no independent review
+    scope = summary_files(summary) or changed_files(repo, a.base)
+    if scope and all(is_doc(f) for f in scope):
+        print(f"changes: skipped (docs only: {len(scope)} file{'s' * (len(scope) != 1)})")
+        print("Every in-scope file is documentation; no tester was asked. "
+              "Say in the handoff that the review was skipped and why.")
+        for f in scope:
+            print(f"  {f}")
+        sys.exit(EXIT_SKIPPED)
+
+    # One tester tab (and agent) per developer tab. The developer tab gets a visible
+    # tag once: "rework" -> "rework [a7f2]"; its tester tab is "tester ▸ rework [a7f2]".
+    tabs = herdr_json("tab", "list", "--workspace", ws).get("tabs", [])
+    dev_label = next((str(t.get("label") or "") for t in tabs if t.get("tab_id") == tab), "")
+
+    def tag_of(t):
+        m = TAG.search(str(t.get("label") or ""))
+        return m.group(1) if m else None
+
+    is_tester = lambda t: str(t.get("label") or "").startswith(a.tester + " ▸ ")
+    m = TAG.search(dev_label)
+    taken_elsewhere = m and any(t.get("tab_id") != tab and not is_tester(t)
+                                and tag_of(t) == m.group(1) for t in tabs)
+    if m and not taken_elsewhere:
+        tag, base = m.group(1), dev_label[:m.start()].strip()
+    else:
+        used = {tag_of(t) for t in tabs} - {None}
+        tag = next(x for x in iter(lambda: secrets.token_hex(2), None) if x not in used)
+        base = (TAG.sub("", dev_label).strip() if m else dev_label.strip()) or "tab"
+        run("herdr", "tab", "rename", tab, f"{base} [{tag}]")
+    label = f"{a.tester} ▸ {base} [{tag}]"
+
+    # tester tab + agent
+    hp = shutil.which("herdr-pane") or str(Path(__file__).resolve().with_name("herdr-pane"))
+    existing = next((t for t in tabs if t.get("tab_id") != tab and is_tester(t)
+                     and tag_of(t) == tag), None)
+    pane = None
+    if existing:
+        if existing.get("label") != label:  # follow renames of the developer tab
+            run("herdr", "tab", "rename", existing["tab_id"], label, check=False)
+        panes = herdr_json("pane", "list", "--workspace", ws).get("panes", [])
+        pane = next((p["pane_id"] for p in panes if p.get("tab_id") == existing["tab_id"]), None)
+        if not pane:
+            sys.exit(f"tester tab {existing['tab_id']} has no listed pane")
+
+    # a previous run may have lost its caller while the tester kept working
+    if pending.exists() and pane and agent_status(pane) == "working":
+        sys.exit("a review is still running in the tester tab. "
+                 "Wait for it with: herdr-review --wait-only")
+
+    # round counter: rounds with a valid verdict in this task
+    if a.new:
+        rf.unlink(missing_ok=True)
+    done = 0
+    if rf.exists() and time.time() - rf.stat().st_mtime < STALE_AFTER:
+        done = int(rf.read_text().strip() or 0)
+    n = done + 1
+    if n == 1:  # a new task: earlier rounds' verdicts do not apply
+        for old in d.glob("verdict-*.md"):
+            old.unlink()
+    if n > a.max:
+        rf.unlink(missing_ok=True)  # the next task starts fresh
+        pending.unlink(missing_ok=True)
+        print(f"changes: limit reached ({a.max} review rounds used).")
+        print("Stop. Report the unresolved findings of the last review to the user.")
+        last = d / f"verdict-{a.max}.md"
+        if last.exists() or ver.exists():
+            print(f"Last verdict: {last if last.exists() else ver}")
+        sys.exit(EXIT_LIMIT)
+
+    # request file
+    ver.unlink(missing_ok=True)
+    req.write_text(REQUEST.format(n=n, mx=a.max, repo=repo, ver=ver,
+                                  changes=changes_text(repo, a.base),
+                                  howto=howto_text(repo),
+                                  again=AGAIN.format(prev=d / f"verdict-{n - 1}.md") if n > 1 else "",
+                                  summary=summary.strip(),
+                                  devtab=f"{base} [{tag}]"))
+
+    if not pane:
+        pane = run(hp, label, "--cwd", repo).stdout.strip()
+    if agent_status(pane) is None:
+        start_agent(pane, agent_name(a.tester, base, tag))
+
+    pending.write_text(json.dumps({"pane": pane, "round": n, "max": a.max, "label": label}))
+    msg = f"Review request: read {req} and follow it. Write the verdict to {ver}."
+    p = run("herdr", "agent", "prompt", pane, msg, "--wait",
+            "--timeout", str(a.timeout * 1000), check=False)
+    if p.returncode != 0 and not ver.exists() and "timeout" not in (p.stderr + p.stdout).lower():
+        pending.unlink(missing_ok=True)  # the prompt was never accepted
+    finish(st, n, a.max, label, pane, p)
+
+
+if __name__ == "__main__":
+    main()

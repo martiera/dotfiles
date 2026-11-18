@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""herdr-pane NAME [--cwd PATH] [--focus]
+
+Resolve NAME to a pane id and print it on stdout.
+
+Lookup order (workspace = "space"):
+  1. pane labelled NAME in the caller's tab (the caller's own pane is skipped)
+  2. tab labelled NAME in the caller's workspace -> its first pane
+  3. create a tab labelled NAME in the caller's workspace -> its root pane
+
+How it was resolved is printed on stderr: found-pane | found-tab | created-tab.
+Must run inside a herdr pane (HERDR_* env), or with a focused pane available.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+
+def herdr(*args):
+    p = subprocess.run(["herdr", *args], capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"herdr {' '.join(args)}: {(p.stderr or p.stdout).strip()}")
+    out = p.stdout.strip()
+    return json.loads(out) if out else {}
+
+
+def result(resp):
+    return resp.get("result", resp)
+
+
+def label(obj):
+    return obj.get("label") or obj.get("name")
+
+
+def context():
+    ws, tab, pane = (os.environ.get(k) for k in
+                     ("HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID"))
+    if not (ws and tab):
+        p = result(herdr("pane", "current"))["pane"]
+        ws, tab, pane = p["workspace_id"], p["tab_id"], p["pane_id"]
+    return ws, tab, pane
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("name")
+    ap.add_argument("--cwd", help="cwd for a newly created tab")
+    ap.add_argument("--focus", action="store_true", help="focus a newly created tab")
+    a = ap.parse_args()
+
+    ws, tab, me = context()
+    panes = result(herdr("pane", "list", "--workspace", ws)).get("panes", [])
+
+    # 1. same tab
+    for p in panes:
+        if p.get("tab_id") == tab and p.get("pane_id") != me and label(p) == a.name:
+            print("found-pane", file=sys.stderr)
+            print(p["pane_id"])
+            return
+
+    # 2. other tabs in the same workspace
+    tabs = result(herdr("tab", "list", "--workspace", ws)).get("tabs", [])
+    for t in tabs:
+        if label(t) == a.name:
+            for p in panes:
+                if p.get("tab_id") == t["tab_id"]:
+                    print("found-tab", file=sys.stderr)
+                    print(p["pane_id"])
+                    return
+            sys.exit(f"tab {t['tab_id']} matches '{a.name}' but has no listed pane")
+
+    # 3. create
+    cmd = ["tab", "create", "--workspace", ws, "--label", a.name,
+           "--focus" if a.focus else "--no-focus"]
+    if a.cwd:
+        cmd += ["--cwd", a.cwd]
+    root = result(herdr(*cmd))["root_pane"]["pane_id"]
+    herdr("pane", "rename", root, a.name)
+    print("created-tab", file=sys.stderr)
+    print(root)
+
+
+if __name__ == "__main__":
+    main()
+
