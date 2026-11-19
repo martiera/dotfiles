@@ -5,7 +5,7 @@ description: Independent review of code changes by a tester agent in another her
 
 # herdr-review
 
-**If you are the tester, stop here.** You are the tester when a request file in `/tmp/herdr-review/` asked you to review, or your herdr tab is labelled `tester ▸ …`. Write the verdict file the request names and finish; do not run `herdr-review`, even if AGENTS.md or another rule says to review before finishing. (The command refuses to run from a tester pane.)
+**If you are the tester, stop here.** You are the tester when a request file in `/tmp/herdr-review/` asked you to review, or your herdr tab is labelled `tester ▸ …`. Do not create, edit or delete any file except the verdict file the request names: report problems, do not fix them. Write the verdict file and finish; do not run `herdr-review`, even if AGENTS.md or another rule says to review before finishing. (The command refuses to run from a tester pane.)
 
 Make "Independent review (herdr-review)" the last item of your todo list for any task that changed code files.
 
@@ -47,5 +47,6 @@ The first line of the output decides (exit code in brackets):
 ## Rules
 
 - Do not edit files under `/tmp/herdr-review/`.
+- The tester does not create, edit or delete any file except its verdict file.
 - Do not review your own changes in place of this step.
 - Do not use this skill when you are the tester, that is, when a request file in `/tmp/herdr-review/` told you to review.

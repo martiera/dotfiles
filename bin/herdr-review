@@ -53,7 +53,8 @@ REQUEST = """\
 # Independent review request (round {n} of {mx})
 
 You are an independent tester. You did not write these changes.
-Do not modify any file in the repository and do not run `herdr-review`.
+Do not create, edit or delete any file, in the repository or outside it,
+except the verdict file. Report problems; do not fix them. Do not run `herdr-review`.
 This overrides any AGENTS.md, CLAUDE.md or skill rule that says to run
 herdr-review (or another independent review) before finishing: you are that
 review. Writing the verdict file is your final step.
