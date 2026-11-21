@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """herdr-review [--max N] [--timeout SEC] [--tester NAME] [--base REV] [--new] (SUMMARY | -)
 herdr-review --wait-only [--timeout SEC] [--tester NAME]
+herdr-review --fingerprint | --skip
 
 Ask an independent omp agent in this developer tab's own tester tab
 ('<prefix> ▸ <dev tab name> [<tag>]') to review the changes of the current
@@ -33,6 +34,14 @@ or from a pane that has a review request open exits 1 without side effects.
 The tester is found by its agent name first, then by its tab tag, so one
 developer tab keeps one tester. When that tester is busy with an earlier
 request, the new request waits for it (within --timeout) instead of failing.
+--fingerprint prints a hash of the current non-doc changes (nothing if there are
+none); usable outside herdr. An approved review stores that hash in
+<git dir>/herdr-review.ok; --skip stores it in <git dir>/herdr-review.skip. Both
+stop matching as soon as a code file changes again (used by the Claude Code Stop hook).
+Every valid verdict is also appended to docs/review-log.md (review-log.md when the repo
+has no docs/ directory) so recurring findings can be turned into rules later.
+Globs in <repo>/.herdr-review.ignore (one per line, '#' comments; a glob with '/' matches
+the repo-relative path, one without matches the file name) are left out of the hash and the scope check.
 Requires: herdr, herdr-pane (same PATH), git.
 """
 import argparse
@@ -115,6 +124,95 @@ def changed_files(repo, base):
 
 def is_doc(path):
     return Path(path).suffix.lower() in DOC_SUFFIXES
+
+
+def ignored(repo, path):
+    """True for paths matched by a glob in <repo>/.herdr-review.ignore (generated files)."""
+    import fnmatch
+    f = Path(repo) / ".herdr-review.ignore"
+    if not f.is_file():
+        return False
+    for line in f.read_text().splitlines():
+        g = line.strip()
+        if not g or g.startswith("#"):
+            continue
+        # a glob with a '/' matches the repo-relative path; one without matches the file name
+        if fnmatch.fnmatch(path, g) or ("/" not in g and fnmatch.fnmatch(Path(path).name, g)):
+            return True
+    return False
+
+
+def code_changes(repo, base="HEAD"):
+    """Changed files that need review: not docs, not ignored."""
+    return sorted(f for f in set(changed_files(repo, base))
+                  if not is_doc(f) and not ignored(repo, f))
+
+
+def fingerprint(repo):
+    """Hash of the non-doc changes against HEAD (paths + content); '' when there are none."""
+    import hashlib
+    files = code_changes(repo)
+    if not files:
+        return ""
+    h = hashlib.sha256()
+    for f in files:
+        full = Path(repo) / f
+        blob = (run("git", "-C", repo, "hash-object", "--", f, check=False).stdout.strip()
+                if full.is_file() else "deleted")
+        h.update(f"{f}\0{blob}\n".encode())
+    return h.hexdigest()
+
+
+def in_scope(path, scope):
+    for t in scope:
+        t = t[2:] if t.startswith("./") else t
+        if path == t or path.startswith(t.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def scoped_fingerprint(repo, scope):
+    """fingerprint(), but '' unless every changed non-doc file is inside the review scope."""
+    outside = [f for f in code_changes(repo) if not in_scope(f, scope)]
+    return ("", outside) if outside else (fingerprint(repo), [])
+
+
+LOG_MAX = 4000  # characters of findings kept per log entry
+
+
+def task_line(summary):
+    for line in summary.splitlines():
+        m = re.match(r"^\s*Task\s*:\s*(.+)", line, re.I)
+        if m:
+            return m.group(1).strip()[:200]
+    return ""
+
+
+def log_verdict(repo, n, kind, task, text):
+    """Append a verdict to the repo's review log so recurring findings can be spotted later.
+    docs/review-log.md when the repo has a docs/ directory, else review-log.md."""
+    path = Path(repo) / ("docs" if (Path(repo) / "docs").is_dir() else "") / "review-log.md"
+    head = run("git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip()
+    sha = run("git", "-C", repo, "rev-parse", "--short", "HEAD", check=False).stdout.strip()
+    body = "\n".join(text.splitlines()[1:]).strip()
+    if len(body) > LOG_MAX:
+        body = body[:LOG_MAX].rstrip() + "\n[truncated]"
+    entry = f"## {time.strftime('%Y-%m-%d %H:%M')} · round {n} · {kind} · {head}@{sha}\n"
+    if task:
+        entry += f"Task: {task}\n"
+    if body:
+        entry += "\n" + body + "\n"
+    first = not path.exists()
+    with open(path, "a") as fh:
+        if first:
+            fh.write("# Review log\n\nAppended by `herdr-review` after every verdict. Read it for "
+                     "findings that recur; turn those into a rule, lint check or test.\n\n")
+        fh.write(entry + "\n")
+
+
+def git_dir(repo):
+    g = run("git", "-C", repo, "rev-parse", "--git-dir").stdout.strip()
+    return Path(g) if os.path.isabs(g) else Path(repo) / g
 
 
 AGENT_DOCS = ("AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md")
@@ -265,8 +363,31 @@ def finish(st, n, mx, label, pane, p=None):
 
     text = ver.read_text().strip()
     first = text.splitlines()[0].strip().lower() if text else ""
+    try:
+        info = json.loads(pending.read_text()) if pending.exists() else {}
+    except Exception:
+        info = {}
+    if info.get("repo") and first.startswith(("changes: approved", "changes: needed")):
+        try:
+            log_verdict(info["repo"], n, "approved" if "approved" in first else "needed",
+                        info.get("task", ""), text)
+        except Exception:
+            pass  # the log is a convenience; never fail a review over it
     if first.startswith("changes: approved"):
         rf.unlink(missing_ok=True)
+        try:
+            if info.get("repo") and info.get("fp"):
+                if fingerprint(info["repo"]) == info["fp"]:
+                    (git_dir(info["repo"]) / "herdr-review.ok").write_text(info["fp"] + "\n")
+                else:
+                    print("note: approved, but the code changed during the review; "
+                          "no marker written, the Stop hook will still ask.", file=sys.stderr)
+            elif info.get("repo"):
+                print("note: approved, but the working tree has code changes outside the "
+                      "review scope (" + ", ".join(info.get("outside", [])[:5]) + "); "
+                      "no marker written, the Stop hook will still ask.", file=sys.stderr)
+        except Exception:
+            pass  # the marker is a convenience; never fail a review over it
         (ver.parent / f"verdict-{n}.md").write_text(text + "\n")
     elif first.startswith("changes: needed"):
         rf.write_text(str(n))
@@ -292,7 +413,21 @@ def main():
     ap.add_argument("--new", action="store_true", help="new task: restart the round counter")
     ap.add_argument("--wait-only", action="store_true",
                     help="send nothing; wait for the running review and print its verdict")
+    ap.add_argument("--fingerprint", action="store_true",
+                    help="print a hash of the current non-doc changes and exit")
+    ap.add_argument("--skip", action="store_true",
+                    help="mark the current non-doc changes as deliberately not reviewed")
     a = ap.parse_args()
+    if a.fingerprint or a.skip:
+        repo = run("git", "rev-parse", "--show-toplevel").stdout.strip()
+        fp = fingerprint(repo)
+        if a.fingerprint:
+            print(fp)
+        else:
+            if fp:
+                (git_dir(repo) / "herdr-review.skip").write_text(fp + "\n")
+            print("skip recorded for the current changes" if fp else "no code changes to skip")
+        return
     if a.wait_only == (a.summary is not None):
         ap.error("give SUMMARY (or '-'), or --wait-only, not both")
 
@@ -428,7 +563,10 @@ def main():
     else:
         wait_until_idle(pane, a.timeout, label)
 
-    pending.write_text(json.dumps({"pane": pane, "round": n, "max": a.max, "label": label}))
+    fp, outside = scoped_fingerprint(repo, scope)
+    pending.write_text(json.dumps({"pane": pane, "round": n, "max": a.max, "label": label,
+                                   "repo": repo, "fp": fp, "outside": outside,
+                                   "task": task_line(summary)}))
     msg = f"Review request: read {req} and follow it. Write the verdict to {ver}."
     started = time.time()
     p = run("herdr", "agent", "prompt", pane, msg, "--wait",

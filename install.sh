@@ -6,6 +6,10 @@
 #   - write .agents/skills/herdr-review/SKILL.md from agents/skills/
 #   - add or refresh the review rule in AGENTS.md, between
 #     <!-- herdr-review:start --> and <!-- herdr-review:end -->
+#   - copy claude/hooks/* to .claude/hooks/ and merge claude/settings.hooks.json
+#     into .claude/settings.json (needs jq; existing keys are kept)
+#   - add or refresh the loop rules in AGENTS.md, between
+#     <!-- loop-rules:start --> and <!-- loop-rules:end -->
 # Nothing is committed in REPO; review and commit the changes yourself.
 # Safe to re-run.
 set -eu
@@ -15,7 +19,7 @@ start='<!-- herdr-review:start -->'
 end='<!-- herdr-review:end -->'
 
 case "${1:-}" in
-  -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 link_bin() {
@@ -52,22 +56,26 @@ install_skill() {
 
 install_rule() {
   repo=$1
+  mstart=${2:-$start}
+  mend=${3:-$end}
+  tpl=${4:-AGENTS.herdr-review.md}
+  mention=${5:-herdr-review}
   agents="$repo/AGENTS.md"
-  block=$(printf '%s\n' "$start"; cat "$here/templates/AGENTS.herdr-review.md"; printf '%s\n' "$end")
+  block=$(printf '%s\n' "$mstart"; cat "$here/templates/$tpl"; printf '%s\n' "$mend")
 
   if [ ! -f "$agents" ]; then
     printf '# Agent guidance\n\n%s\n' "$block" > "$agents"
     echo "  AGENTS.md: created with the review rule"
     return
   fi
-  if grep -qF "$start" "$agents"; then
-    if ! grep -qF "$end" "$agents"; then
-      echo "  AGENTS.md: '$start' has no matching end marker; fix it by hand" >&2
+  if grep -qF "$mstart" "$agents"; then
+    if ! grep -qF "$mend" "$agents"; then
+      echo "  AGENTS.md: '$mstart' has no matching end marker; fix it by hand" >&2
       return 1
     fi
     tmp=$(mktemp)
     # replace everything between the markers (inclusive) with the current block
-    BLOCK=$block awk -v s="$start" -v e="$end" '
+    BLOCK=$block awk -v s="$mstart" -v e="$mend" '
       $0 == s { print ENVIRON["BLOCK"]; skip = 1; next }
       $0 == e { skip = 0; next }
       !skip' "$agents" > "$tmp"
@@ -78,12 +86,46 @@ install_rule() {
     fi
     return
   fi
-  if grep -q 'herdr-review' "$agents"; then
-    echo "  AGENTS.md: already mentions herdr-review without markers; left as is"
+  if grep -q "$mention" "$agents"; then
+    echo "  AGENTS.md: already mentions $mention without markers; left as is"
     return
   fi
   printf '\n%s\n' "$block" >> "$agents"
   echo "  AGENTS.md: rule appended"
+}
+
+install_hooks() {
+  repo=$1
+  mkdir -p "$repo/.claude/hooks"
+  for f in "$here"/claude/hooks/*.sh; do
+    dst="$repo/.claude/hooks/$(basename "$f")"
+    if [ -f "$dst" ] && cmp -s "$f" "$dst"; then continue; fi
+    cp "$f" "$dst"; chmod +x "$dst"; echo "  hook: $(basename "$f")"
+  done
+  if [ ! -f "$repo/.claude/guard.deny" ]; then
+    printf '# Extended regexes, one per line, denied by the Bash guard hook.\n# allow:<regex> exempts a command from this file'"'"'s deny lines.\n' > "$repo/.claude/guard.deny"
+    echo "  guard.deny: created (add the repo's own rules)"
+  fi
+  if [ ! -f "$repo/.herdr-review.ignore" ]; then
+    printf '# Globs of generated files the review reminder and approval marker ignore.\n# One per line; a glob with '/' matches the path, one without the file name.\n' > "$repo/.herdr-review.ignore"
+    echo "  .herdr-review.ignore: created (list generated files, e.g. *.tsbuildinfo)"
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "  settings: jq missing, merge claude/settings.hooks.json into .claude/settings.json by hand" >&2
+    return
+  fi
+  cfg="$repo/.claude/settings.json"
+  [ -f "$cfg" ] || echo '{}' > "$cfg"
+  tmp=$(mktemp)
+  jq --slurpfile add "$here/claude/settings.hooks.json" '
+    reduce ($add[0].hooks | to_entries[]) as $e (.;
+      .hooks[$e.key] = (
+        ((.hooks[$e.key] // []) + $e.value)
+        | reduce .[] as $g ([];
+            if any(.[]; .matcher == $g.matcher and ([.hooks[].command] == [$g.hooks[].command]))
+            then . else . + [$g] end)))' "$cfg" > "$tmp" &&
+  if cmp -s "$tmp" "$cfg"; then rm -f "$tmp"; echo "  settings: hooks unchanged"
+  else cat "$tmp" > "$cfg"; rm -f "$tmp"; echo "  settings: hooks merged"; fi
 }
 
 link_bin
@@ -96,5 +138,7 @@ for arg in "$@"; do
   echo "repo $repo"
   install_skill "$repo"
   install_rule "$repo"
+  install_rule "$repo" '<!-- loop-rules:start -->' '<!-- loop-rules:end -->' AGENTS.loop-rules.md 'Loop rules'
+  install_hooks "$repo"
 done
 [ $# -eq 0 ] || echo "Review and commit the changes in each repo yourself."
