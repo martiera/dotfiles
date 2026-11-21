@@ -1,0 +1,9 @@
+#!/bin/sh
+# herdr-review-gate (installed by dotfiles install.sh)
+# Refuses a commit of code files that have no approved or skipped herdr-review for
+# exactly this content. Docs and ignored files pass. Fails open when herdr-review or
+# python3 is missing (for example a commit from inside a container).
+# Ways past it: review, `herdr-review --skip`, or `git commit --no-verify`.
+command -v herdr-review >/dev/null 2>&1 || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+exec herdr-review --check-staged

@@ -27,7 +27,8 @@ EOF
 ```
 
 - `--new` on the first review of a task, so rounds left over from an earlier task do not count.
-- `--base <rev>` when the task's changes are already committed: the tester reviews the commits after `<rev>` plus uncommitted work. Without it only uncommitted work is reviewed.
+- Review before you commit code. A pre-commit gate (installed by dotfiles `install.sh`) refuses a commit of code files that have no approved review for exactly that content; `herdr-review --skip` or `git commit --no-verify` are the user's ways past it.
+- `--base <rev>` only when the task's changes are already committed (for example with `--no-verify`): the tester reviews the commits after `<rev>` plus uncommitted work. Without it only uncommitted work is reviewed.
 
 If your tester is still busy with an earlier request, the command waits for it and then sends yours; it prints a note on stderr while it waits.
 The command blocks until the tester finishes, which can take several minutes (up to 30).

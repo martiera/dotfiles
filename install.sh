@@ -6,10 +6,12 @@
 #   - write .agents/skills/herdr-review/SKILL.md from agents/skills/
 #   - add or refresh the review rule in AGENTS.md, between
 #     <!-- herdr-review:start --> and <!-- herdr-review:end -->
-#   - copy claude/hooks/* to .claude/hooks/ and merge claude/settings.hooks.json
+#   - copy claude/hooks/guard-bash.sh to .claude/hooks/ and merge claude/settings.hooks.json
 #     into .claude/settings.json (needs jq; existing keys are kept)
 #   - add or refresh the loop rules in AGENTS.md, between
 #     <!-- loop-rules:start --> and <!-- loop-rules:end -->
+#   - install git-hooks/pre-commit into the clone's hooks directory (skipped when
+#     core.hooksPath is set or a different pre-commit hook exists)
 # Nothing is committed in REPO; review and commit the changes yourself.
 # Safe to re-run.
 set -eu
@@ -19,7 +21,7 @@ start='<!-- herdr-review:start -->'
 end='<!-- herdr-review:end -->'
 
 case "${1:-}" in
-  -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 esac
 
 link_bin() {
@@ -94,6 +96,25 @@ install_rule() {
   echo "  AGENTS.md: rule appended"
 }
 
+install_gate() {
+  repo=$1
+  src="$here/git-hooks/pre-commit"
+  if [ -n "$(git -C "$repo" config core.hooksPath 2>/dev/null)" ]; then
+    echo "  pre-commit: core.hooksPath is set; add git-hooks/pre-commit to it by hand" >&2
+    return
+  fi
+  dst=$(git -C "$repo" rev-parse --git-path hooks/pre-commit)
+  case "$dst" in /*) ;; *) dst="$repo/$dst" ;; esac
+  if [ -f "$dst" ] && ! grep -q 'herdr-review-gate' "$dst"; then
+    echo "  pre-commit: $dst exists and is not ours; left as is" >&2
+    return
+  fi
+  if [ -f "$dst" ] && cmp -s "$src" "$dst"; then echo "  pre-commit: unchanged"; return; fi
+  mkdir -p "$(dirname "$dst")"
+  cp "$src" "$dst"; chmod +x "$dst"
+  echo "  pre-commit: installed ($dst; local to this clone)"
+}
+
 install_hooks() {
   repo=$1
   mkdir -p "$repo/.claude/hooks"
@@ -140,5 +161,6 @@ for arg in "$@"; do
   install_rule "$repo"
   install_rule "$repo" '<!-- loop-rules:start -->' '<!-- loop-rules:end -->' AGENTS.loop-rules.md 'Loop rules'
   install_hooks "$repo"
+  install_gate "$repo"
 done
 [ $# -eq 0 ] || echo "Review and commit the changes in each repo yourself."
