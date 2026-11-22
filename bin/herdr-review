@@ -90,7 +90,9 @@ If needed, follow with a numbered list: file:line, the problem, the required cha
 
 AGAIN = ("This is a re-review. Your previous verdict is in {prev}: first check that "
          "every finding in it is fixed (or that the developer summary gives a valid reason "
-         "not to), then review the whole change again.\n")
+         "not to), then re-read the diff of the files changed since that verdict. Re-run only "
+         "the checks those files affect, not the whole matrix again, unless the summary says "
+         "something else changed.\n")
 
 EXIT_APPROVED, EXIT_LIMIT, EXIT_NEEDED, EXIT_SKIPPED = 0, 3, 4, 5
 
