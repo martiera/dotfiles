@@ -1,13 +1,17 @@
 #!/bin/sh
-# Usage: ./install.sh [REPO ...]
+# Usage: ./install.sh [--claude | --no-claude] [REPO ...]
 #
 # Always: symlink bin/* into ~/.local/bin (never overwrites a real file).
 # For each REPO (a git checkout) also enable herdr-review there:
 #   - write .agents/skills/herdr-review/SKILL.md from agents/skills/
 #   - add or refresh the review rule in AGENTS.md, between
 #     <!-- herdr-review:start --> and <!-- herdr-review:end -->
-#   - copy claude/hooks/guard-bash.sh to .claude/hooks/ and merge claude/settings.hooks.json
-#     into .claude/settings.json (needs jq; existing keys are kept)
+#   - create .agents/guard.deny and .herdr-review.ignore if missing (agent-neutral; see
+#     bin/herdr-guard in the README for wiring the guard into other agents)
+#   - Claude Code adapter, only with --claude or when the repo has .claude/ or CLAUDE.md
+#     (--no-claude skips it): copy claude/hooks/guard-bash.sh and the guard core to
+#     .claude/hooks/ and merge claude/settings.hooks.json into .claude/settings.json
+#     (needs jq; existing keys are kept)
 #   - add or refresh the loop rules in AGENTS.md, between
 #     <!-- loop-rules:start --> and <!-- loop-rules:end -->
 #   - install git-hooks/pre-commit into the clone's hooks directory (skipped when
@@ -20,9 +24,30 @@ here=$(cd "$(dirname "$0")" && pwd)
 start='<!-- herdr-review:start -->'
 end='<!-- herdr-review:end -->'
 
-case "${1:-}" in
-  -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-esac
+claude=auto
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --claude) claude=yes; shift ;;
+    --no-claude) claude=no; shift ;;
+    --) shift; break ;;
+    -*) echo "unknown option $1" >&2; exit 2 ;;
+    *) break ;;
+  esac
+done
+
+wants_claude() {
+  case "$claude" in
+    yes) return 0 ;;
+    no) return 1 ;;
+  esac
+  [ -d "$1/.claude" ] || [ -f "$1/CLAUDE.md" ]
+}
+
+copy_hook() {
+  if [ -f "$2" ] && cmp -s "$1" "$2"; then return; fi
+  cp "$1" "$2"; chmod +x "$2"; echo "  hook: $(basename "$2")"
+}
 
 link_bin() {
   mkdir -p "$HOME/.local/bin"
@@ -115,22 +140,24 @@ install_gate() {
   echo "  pre-commit: installed ($dst; local to this clone)"
 }
 
-install_hooks() {
+install_stubs() {
   repo=$1
-  mkdir -p "$repo/.claude/hooks"
-  for f in "$here"/claude/hooks/*.sh; do
-    dst="$repo/.claude/hooks/$(basename "$f")"
-    if [ -f "$dst" ] && cmp -s "$f" "$dst"; then continue; fi
-    cp "$f" "$dst"; chmod +x "$dst"; echo "  hook: $(basename "$f")"
-  done
-  if [ ! -f "$repo/.claude/guard.deny" ]; then
-    printf '# Extended regexes, one per line, denied by the Bash guard hook.\n# allow:<regex> exempts a command from this file'"'"'s deny lines.\n' > "$repo/.claude/guard.deny"
-    echo "  guard.deny: created (add the repo's own rules)"
+  if [ ! -f "$repo/.agents/guard.deny" ] && [ ! -f "$repo/.claude/guard.deny" ]; then
+    mkdir -p "$repo/.agents"
+    printf '# Extended regexes, one per line, denied by the command guard (bin/herdr-guard).\n# allow:<regex> exempts a command from this file'"'"'s deny lines.\n' > "$repo/.agents/guard.deny"
+    echo "  guard.deny: created in .agents/ (add the repo's own rules)"
   fi
   if [ ! -f "$repo/.herdr-review.ignore" ]; then
     printf '# Globs of generated files the review reminder and approval marker ignore.\n# One per line; a glob with '/' matches the path, one without the file name.\n' > "$repo/.herdr-review.ignore"
     echo "  .herdr-review.ignore: created (list generated files, e.g. *.tsbuildinfo)"
   fi
+}
+
+install_claude() {
+  repo=$1
+  mkdir -p "$repo/.claude/hooks"
+  copy_hook "$here/claude/hooks/guard-bash.sh" "$repo/.claude/hooks/guard-bash.sh"
+  copy_hook "$here/bin/herdr-guard" "$repo/.claude/hooks/guard-core.sh"
   if ! command -v jq >/dev/null 2>&1; then
     echo "  settings: jq missing, merge claude/settings.hooks.json into .claude/settings.json by hand" >&2
     return
@@ -160,7 +187,12 @@ for arg in "$@"; do
   install_skill "$repo"
   install_rule "$repo"
   install_rule "$repo" '<!-- loop-rules:start -->' '<!-- loop-rules:end -->' AGENTS.loop-rules.md 'Loop rules'
-  install_hooks "$repo"
+  install_stubs "$repo"
+  if wants_claude "$repo"; then
+    install_claude "$repo"
+  else
+    echo "  claude adapter: skipped (no .claude/ or CLAUDE.md; use --claude)"
+  fi
   install_gate "$repo"
 done
 [ $# -eq 0 ] || echo "Review and commit the changes in each repo yourself."

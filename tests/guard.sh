@@ -3,7 +3,10 @@
 . "$(dirname "$0")/lib.sh"
 proj="$tmp/proj"; mkdir -p "$proj/.claude"
 printf '%s\n' '# test rules' '^make deploy' 'allow:^make deploy --dry-run$' > "$proj/.claude/guard.deny"
-guard="$root/claude/hooks/guard-bash.sh"
+hooks="$tmp/hooks"; mkdir -p "$hooks"
+cp "$root/claude/hooks/guard-bash.sh" "$hooks/guard-bash.sh"
+cp "$root/bin/herdr-guard" "$hooks/guard-core.sh"; chmod +x "$hooks/guard-core.sh"
+guard="$hooks/guard-bash.sh"
 
 # denied COMMAND: the hook printed a deny decision
 run_guard() { printf '%s' "$1" | jq -Rs '{tool_input:{command:.}}' | CLAUDE_PROJECT_DIR=$proj sh "$guard"; }
@@ -38,4 +41,12 @@ a 'cat deploy.sh'
 rm "$proj/.claude/guard.deny"
 a 'make deploy'
 check "fails open without jq" 0 sh -c "printf '{}' | PATH=/nonexistent /bin/sh $guard"
+
+# The neutral core: exit 2 = denied, reads .agents/guard.deny first, plain or --json input.
+mkdir -p "$proj/.agents"; printf '%s\n' '^make ship' > "$proj/.agents/guard.deny"
+check "core denies a built-in command (exit 2)" 2 sh -c "printf 'git push -f' | $root/bin/herdr-guard --project $proj"
+check "core denies a .agents/guard.deny line (exit 2)" 2 sh -c "printf 'make ship' | $root/bin/herdr-guard --project $proj"
+check "core allows an ordinary command" 0 sh -c "printf 'ls' | $root/bin/herdr-guard --project $proj"
+check "core reads --json payloads" 2 sh -c "printf '{\"command\":\"make ship\"}' | $root/bin/herdr-guard --json --project $proj"
+rm "$proj/.agents/guard.deny"
 summary

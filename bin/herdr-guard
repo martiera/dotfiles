@@ -1,0 +1,64 @@
+#!/bin/sh
+# Usage: herdr-guard [--project DIR] [--json]
+#
+# Agent-neutral command guard. Reads one shell command on stdin (with --json: a hook
+# payload; the command is taken from .tool_input.command or .command, needs jq).
+# Exit 0: allowed. Exit 2: denied, the reason is on stderr (exit 2 is the "block" code
+# of most agents' command hooks). Fails open (exit 0) when the command is empty or
+# --json is used without jq.
+#
+# Built-in list below; a repo adds its own in .agents/guard.deny (or .claude/guard.deny),
+# one extended regex per line ('#' comments). A line starting with 'allow:' is an
+# exception to the repo's deny lines only (never to the built-in list).
+project=.
+json=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project) project=${2:?--project needs a directory}; shift 2 ;;
+    --json) json=1; shift ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "herdr-guard: unknown argument $1" >&2; exit 1 ;;
+  esac
+done
+
+if [ "$json" = 1 ]; then
+  command -v jq >/dev/null 2>&1 || exit 0
+  cmd=$(jq -r '.tool_input.command // .command // empty')
+else
+  cmd=$(cat)
+fi
+[ -z "$cmd" ] && exit 0
+
+deny() { printf '%s\n' "$1" >&2; exit 2; }
+
+# Check each segment of a chained command on its own, so an allow: match on one
+# segment cannot exempt another.
+segments=$(printf '%s' "$cmd" | tr ';&|' '\n\n\n')
+builtin='docker compose[^|;&]* down[^|;&]*(-v|--volumes)|docker-compose[^|;&]* down[^|;&]*(-v|--volumes)|docker [a-z]+ prune|docker volume rm|git push[^|;&]* (--force|-f)( |$)|git push[^|;&]* \+[A-Za-z]|rm -rf? +(/|~|\$HOME)( |$)'
+printf '%s' "$cmd" | grep -Eq "$builtin" && deny "Blocked by the shared guard: destructive command. Ask the user."
+
+file=
+for f in "$project/.agents/guard.deny" "$project/.claude/guard.deny"; do
+  [ -f "$f" ] && { file=$f; break; }
+done
+[ -n "$file" ] || exit 0
+# Prints the first deny line that matches a segment not exempted by an allow: line.
+# (A function: macOS sh cannot parse these case patterns inside $( ... ).)
+find_hit() {
+  printf '%s\n' "$segments" | while IFS= read -r seg; do
+    seg=$(printf '%s' "$seg" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -z "$seg" ] && continue
+    allowed=0
+    while IFS= read -r line; do
+      case "$line" in allow:*) printf '%s' "$seg" | grep -Eq "${line#allow:}" && allowed=1 ;; esac
+    done < "$file"
+    [ "$allowed" = 1 ] && continue
+    while IFS= read -r line; do
+      case "$line" in ''|'#'*|allow:*) continue ;; esac
+      printf '%s' "$seg" | grep -Eq "$line" && { printf '%s' "$line"; exit 0; }
+    done < "$file"
+  done
+}
+hit=$(find_hit)
+[ -n "$hit" ] && deny "Blocked by ${file#"$project"/} ($hit). Ask the user for approval first."
+exit 0

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""herdr-review [--max N] [--timeout SEC] [--tester NAME] [--base REV] [--new] (SUMMARY | -)
+"""herdr-review [--max N] [--timeout SEC] [--tester NAME] [--kind KIND] [--model MODEL] [--base REV] [--new] (SUMMARY | -)
 herdr-review --wait-only [--timeout SEC] [--tester NAME]
 herdr-review --skip | --check-staged
 
-Ask an independent omp agent in this developer tab's own tester tab
+Ask an independent tester agent (--kind, default omp) in this developer tab's own tester tab
 ('<prefix> ▸ <dev tab name> [<tag>]') to review the changes of the current
 git repository since --base (default HEAD: uncommitted work only), wait for
 it, print its verdict.
@@ -41,6 +41,10 @@ An approval (and --skip) also records the reviewed (path, content id) pairs in
 staged code file's staged content is in that list (merges, docs and ignored files pass).
 Globs in <repo>/.herdr-review.ignore (one per line, '#' comments; a glob with '/' matches
 the repo-relative path, one without matches the file name) are never treated as code changes.
+The tester agent kind is --kind, else $HERDR_REVIEW_KIND, else omp; it is passed to
+`herdr agent start --kind` and only used when a new tester has to be started.
+The tester model is --model, else $HERDR_REVIEW_MODEL, else the agent's own default; it is
+passed as `-- --model MODEL` to the agent, so the agent must accept a --model option.
 Requires: herdr, herdr-pane (same PATH), git.
 """
 import argparse
@@ -362,11 +366,14 @@ def await_late_start(pane, ver, timeout):
     return None
 
 
-def start_agent(pane, name, tries=20):
+def start_agent(pane, name, kind, model="", tries=20):
     """`herdr agent start` needs an idle shell prompt; a fresh tab may not have one yet."""
     err = ""
     for _ in range(tries):
-        p = run("herdr", "agent", "start", name, "--kind", "omp", "--pane", pane, check=False)
+        cmd = ["herdr", "agent", "start", name, "--kind", kind, "--pane", pane]
+        if model:
+            cmd += ["--", "--model", model]
+        p = run(*cmd, check=False)
         if p.returncode == 0:
             return
         err = (p.stderr or p.stdout).strip()
@@ -449,6 +456,10 @@ def main():
     ap.add_argument("--max", type=int, default=4, help="max review rounds (default 4)")
     ap.add_argument("--timeout", type=int, default=1800, help="seconds to wait for the tester")
     ap.add_argument("--tester", default="tester", help="tester tab label prefix (default: tester)")
+    ap.add_argument("--kind", default=os.environ.get("HERDR_REVIEW_KIND") or "omp",
+                    help="tester agent kind for a new tester (default: $HERDR_REVIEW_KIND or omp)")
+    ap.add_argument("--model", default=os.environ.get("HERDR_REVIEW_MODEL") or "",
+                    help="tester model for a new tester, passed as --model (default: $HERDR_REVIEW_MODEL or the agent's default)")
     ap.add_argument("--base", default="HEAD",
                     help="review commits after REV plus uncommitted work (default HEAD)")
     ap.add_argument("--new", action="store_true", help="new task: restart the round counter")
@@ -606,7 +617,7 @@ def main():
     if not pane:
         pane = run(hp, label, "--cwd", repo).stdout.strip()
     if agent_status(pane) is None:
-        start_agent(pane, name)
+        start_agent(pane, name, a.kind, a.model)
     else:
         wait_until_idle(pane, a.timeout, label)
 

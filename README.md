@@ -21,9 +21,13 @@ For each repository path given (any directory inside a git checkout), it also:
   refreshes that block. An `AGENTS.md` that already mentions herdr-review
   without the markers is left alone.
 
-- copies `claude/hooks/guard-bash.sh` to `.claude/hooks/`, creates `.claude/guard.deny` and
-  `.herdr-review.ignore` if missing, and merges `claude/settings.hooks.json` into
-  `.claude/settings.json` with `jq` (existing keys kept, merge is idempotent);
+- creates `.agents/guard.deny` (unless `.claude/guard.deny` exists) and
+  `.herdr-review.ignore` if missing;
+- Claude Code adapter, only with `--claude` or when the repo already has `.claude/` or
+  `CLAUDE.md` (`--no-claude` skips it): copies `claude/hooks/guard-bash.sh` and the guard core
+  (`bin/herdr-guard`, as `guard-core.sh`) to `.claude/hooks/` and merges
+  `claude/settings.hooks.json` into `.claude/settings.json` with `jq` (existing keys kept,
+  merge is idempotent);
 - adds the loop rules from `templates/AGENTS.loop-rules.md` to `AGENTS.md` between
   `<!-- loop-rules:start -->` and `<!-- loop-rules:end -->`;
 - installs `git-hooks/pre-commit` into the clone's hooks directory (skipped when
@@ -41,16 +45,25 @@ or the template to update every repo you pass.
   One tester tab per developer tab, found by its agent name; a new request
   waits while that tester is busy, and a tester pane cannot start a review of
   its own (that used to spawn a "tester ▸ tester ▸ …" tab).
+  The tester agent kind defaults to `omp`; override it with `--kind <kind>` or the
+  `HERDR_REVIEW_KIND` environment variable (used when a new tester is started).
+  Likewise `--model <model>` / `HERDR_REVIEW_MODEL` picks the tester's model (passed to the
+  agent as `--model`; unset means the agent's default).
 - `bin/herdr-pane`: resolves or creates a herdr pane/tab by name; used by
   `herdr-review`.
 - `agents/skills/herdr-review/SKILL.md`: source of the `herdr-review` agent
   skill. Claude Code's user-level copy is synced from claude.ai; update it there
   after changing this file.
 - `templates/AGENTS.herdr-review.md`: the rule added to a repo's `AGENTS.md`.
-- `claude/hooks/guard-bash.sh`: PreToolUse(Bash) hook. Denies destructive commands
-  (`down -v`, prune, force push, `rm -rf /`) and whatever the repo lists in
-  `.claude/guard.deny` (extended regexes; `allow:<regex>` exempts a command from
-  the repo's deny lines).
+- `bin/herdr-guard`: agent-neutral command guard. Reads a shell command on stdin (or a hook
+  JSON payload with `--json`, needs `jq`), exits 2 with the reason on stderr when it is
+  denied, 0 otherwise. Denies destructive commands (`down -v`, prune, force push,
+  `rm -rf /`) and whatever the repo lists in `.agents/guard.deny` (or `.claude/guard.deny`;
+  extended regexes; `allow:<regex>` exempts a command from the repo's deny lines). Wire it
+  into any agent that can run a command before a shell call and honours a blocking exit
+  code, for example `herdr-guard --json --project "$PWD"`. Only the Claude Code wiring
+  below is shipped and tested; I have not verified the hook formats of other agents.
+- `claude/hooks/guard-bash.sh`: Claude Code PreToolUse(Bash) adapter around the guard core.
 - `claude/settings.hooks.json`: the Bash guard entry merged into a repo's settings.
 - `templates/AGENTS.loop-rules.md`: two rules: review before committing code; advisor after two failed fixes.
 - review log (per repo, `docs/review-log.md`, or `review-log.md` when the repo has no `docs/`;
