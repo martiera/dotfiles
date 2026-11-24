@@ -65,7 +65,7 @@ or the template to update every repo you pass.
   below is shipped and tested; I have not verified the hook formats of other agents.
 - `claude/hooks/guard-bash.sh`: Claude Code PreToolUse(Bash) adapter around the guard core.
 - `claude/settings.hooks.json`: the Bash guard entry merged into a repo's settings.
-- `templates/AGENTS.loop-rules.md`: two rules: review before committing code; advisor after two failed fixes.
+- `templates/AGENTS.loop-rules.md`: loop rules: review before committing code; advisor after two failed fixes; cheap checks first; tight review scope; one batched fix per review round; keep bulk output out of context; call the advisor early.
 - review log (per repo, `docs/review-log.md`, or `review-log.md` when the repo has no `docs/`;
   written by `herdr-review`): one entry per verdict (round,
   approved/needed, branch@commit, task, findings). Read it every 10-15 reviews and turn
